@@ -4,7 +4,6 @@ const IPHONE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 async function getBrowser() {
-  // Vercel / Lambda 環境
   if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
     const chromium = require('@sparticuz/chromium');
     return puppeteer.launch({
@@ -24,7 +23,6 @@ async function getBrowser() {
     });
   }
 
-  // ローカル開発: システム Chrome (pipe: true で WebSocket 問題を回避)
   return puppeteer.launch({
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -35,10 +33,22 @@ async function getBrowser() {
 }
 
 export default async function handler(req, res) {
-  const { url, name } = req.query;
+  // POST のみ受け付ける
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'POST only' });
+  }
+
+  const { url, name, sessionid } = req.body;
 
   if (!url) {
-    return res.status(400).json({ error: 'url パラメータが必要です' });
+    return res.status(400).json({ error: 'url が必要です' });
+  }
+
+  // sessionid: リクエストボディ → 環境変数の順で取得
+  const sid = sessionid || process.env.INSTAGRAM_SESSION_ID || '';
+
+  if (!sid) {
+    return res.status(400).json({ error: 'sessionid が必要です。InstagramのCookieから取得してください。' });
   }
 
   const filename = (name ? name.replace(/[/\\?%*:|"<>]/g, '_') : 'screenshot') + '.png';
@@ -50,40 +60,46 @@ export default async function handler(req, res) {
     const page = await browser.newPage();
 
     await page.setUserAgent(IPHONE_UA);
+    await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'light' }]);
 
-    // ライトモード強制
-    await page.emulateMediaFeatures([
-      { name: 'prefers-color-scheme', value: 'light' },
-    ]);
+    // Instagram の認証 Cookie をセット
+    await page.setCookie(
+      { name: 'sessionid', value: sid, domain: '.instagram.com', path: '/', httpOnly: true, secure: true },
+      { name: 'ig_did', value: 'device-' + Math.random().toString(36).slice(2), domain: '.instagram.com', path: '/' },
+      { name: 'csrftoken', value: 'dummy', domain: '.instagram.com', path: '/' }
+    );
 
-    // バナー・ポップアップ系を先にCSSで非表示設定
-    await page.evaluateOnNewDocument(() => {
-      const style = document.createElement('style');
-      style.textContent = `
-        div[role="dialog"], div[role="alertdialog"] { display: none !important; }
-      `;
-      document.addEventListener('DOMContentLoaded', () => {
-        document.head?.appendChild(style);
-      });
+    // リクエストヘッダーを本物のiPhoneブラウザに近づける
+    await page.setExtraHTTPHeaders({
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
     });
 
-    // domcontentloaded で遷移（networkidle2 は Instagram で詰まる）
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
+    await page.evaluateOnNewDocument(() => {
+      const style = document.createElement('style');
+      style.textContent = 'div[role="dialog"], div[role="alertdialog"] { display: none !important; }';
+      document.addEventListener('DOMContentLoaded', () => document.head?.appendChild(style));
+    });
 
-    // コンテンツ描画待ち
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
     await new Promise((r) => setTimeout(r, 5000));
 
-    // モーダル・バナーを DOM から削除
+    // ログインページにリダイレクトされていないか確認
+    const finalUrl = page.url();
+    if (finalUrl.includes('/accounts/login/')) {
+      return res.status(401).json({ error: 'sessionid が無効か期限切れです。再取得してください。' });
+    }
+
+    // モーダル・バナー削除
     await page.evaluate(() => {
-      // ダイアログ系
       document.querySelectorAll('div[role="dialog"], div[role="alertdialog"]').forEach((el) => el.remove());
 
-      // 「アプリを開く」テキストを含む要素を親ごと削除
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       const targets = [];
       while (walker.nextNode()) {
         const text = walker.currentNode.textContent.trim();
-        if (text.includes('アプリを開く') || text.includes('Open App') || text.includes('アプリで開く')) {
+        if (text.includes('アプリを開く') || text.includes('Open App')) {
           let el = walker.currentNode.parentElement;
           for (let i = 0; i < 3; i++) {
             if (el && el.tagName !== 'BODY') el = el.parentElement;
@@ -93,24 +109,19 @@ export default async function handler(req, res) {
       }
       targets.forEach((el) => el.remove());
 
-      // 右上の × ボタンを座標から特定して削除
       const xBtn = document.elementFromPoint(window.innerWidth - 30, 25);
       if (xBtn && !['BODY', 'HTML', 'MAIN'].includes(xBtn.tagName)) {
         let el = xBtn;
         for (let i = 0; i < 4; i++) {
-          if (el.parentElement && !['BODY', 'HTML', 'MAIN'].includes(el.parentElement.tagName)) {
-            el = el.parentElement;
-          }
+          if (el.parentElement && !['BODY', 'HTML', 'MAIN'].includes(el.parentElement.tagName)) el = el.parentElement;
         }
         el.remove();
       }
     }).catch(() => {});
 
-    // ESC でモーダルを閉じる
     await page.keyboard.press('Escape').catch(() => {});
     await new Promise((r) => setTimeout(r, 500));
 
-    // スクリーンショット撮影
     const screenshot = await page.screenshot({
       type: 'png',
       clip: { x: 0, y: 0, width: 390, height: 844 },
@@ -128,5 +139,8 @@ export default async function handler(req, res) {
 }
 
 export const config = {
-  api: { responseLimit: '15mb' },
+  api: {
+    responseLimit: '15mb',
+    bodyParser: { sizeLimit: '1mb' },
+  },
 };
